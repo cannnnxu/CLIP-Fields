@@ -4,8 +4,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from gridencoder import GridEncoder
-from misc import MLP
+from .gridencoder import GridEncoder
+from .misc import MLP
 
 
 class GridCLIPModel(nn.Module):
