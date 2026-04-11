@@ -20,6 +20,61 @@ warnings.filterwarnings("ignore")
 from transformers import logging
 logging.set_verbosity_error()
 
+
+def _as_cpu_tensor(value):
+    return torch.as_tensor(value).detach().cpu()
+
+
+def _sorted_linear_weight_keys(state_dict):
+    keys = [
+        key for key, value in state_dict.items()
+        if (
+            key.startswith("_post_grid.trunk.")
+            and key.endswith(".weight")
+            and getattr(value, "ndim", 0) == 2
+        )
+    ]
+    return sorted(keys, key=lambda key: int(key.split(".")[2]))
+
+
+def _infer_model_kwargs_from_state_dict(state_dict, data, max_coords, min_coords):
+    """Recover GridCLIPModel kwargs for checkpoints saved without metadata."""
+    embeddings = state_dict["_grid_model.embeddings"]
+    offsets = state_dict["_grid_model.offsets"]
+    linear_weight_keys = _sorted_linear_weight_keys(state_dict)
+    if not linear_weight_keys:
+        raise ValueError("Checkpoint does not contain _post_grid linear weights.")
+
+    image_rep_size = data[0]["clip_image_vector"].shape[-1]
+    text_rep_size = data[0]["clip_vector"].shape[-1]
+    output_dim = state_dict[linear_weight_keys[-1]].shape[0]
+    expected_output_dim = image_rep_size + text_rep_size
+    if output_dim != expected_output_dim:
+        raise ValueError(
+            "Checkpoint output dimension does not match the labelled dataset: "
+            f"checkpoint={output_dim}, dataset={expected_output_dim}."
+        )
+
+    level_sizes = offsets[1:] - offsets[:-1]
+    capped_level_size = int(level_sizes.max().item())
+    log2_hashmap_size = int(np.log2(capped_level_size))
+    if 2 ** log2_hashmap_size != capped_level_size:
+        # If no level reached the cap, fall back to the GridCLIPModel default.
+        log2_hashmap_size = 24
+
+    return dict(
+        image_rep_size=image_rep_size,
+        text_rep_size=text_rep_size,
+        mlp_depth=max(0, len(linear_weight_keys) - 1),
+        mlp_width=state_dict[linear_weight_keys[0]].shape[0],
+        log2_hashmap_size=log2_hashmap_size,
+        num_levels=int(offsets.numel() - 1),
+        level_dim=embeddings.shape[1],
+        per_level_scale=2,
+        max_coords=max_coords,
+        min_coords=min_coords,
+    )
+
 @dataclass
 class QueryResult:
     """Result of a single text query against the CLIP-Field."""
@@ -58,22 +113,39 @@ class CLIPFieldQuery:
         min_coords, _ = self._all_xyz.min(dim=0)
 
         # ---- Load trained CLIP-Field model ----
-        
-
-        self._label_model = GridCLIPModel(
-            image_rep_size=self._data[0]["clip_image_vector"].shape[-1],
-            text_rep_size=self._data[0]["clip_vector"].shape[-1],
-            mlp_depth=1,
-            mlp_width=600,
-            log2_hashmap_size=20,
-            num_levels=18,
-            level_dim=8,
-            per_level_scale=2,
-            max_coords=max_coords,
-            min_coords=min_coords,
-        ).to(self.device)
-
         ckpt = torch.load(model_path, map_location=self.device, weights_only=False)
+        if "model_kwargs" in ckpt:
+            model_kwargs = dict(ckpt["model_kwargs"])
+            ckpt_max = _as_cpu_tensor(model_kwargs.get("max_coords", max_coords))
+            ckpt_min = _as_cpu_tensor(model_kwargs.get("min_coords", min_coords))
+            data_max = _as_cpu_tensor(max_coords)
+            data_min = _as_cpu_tensor(min_coords)
+            if not (
+                torch.allclose(ckpt_max, data_max, atol=1e-4, rtol=1e-4)
+                and torch.allclose(ckpt_min, data_min, atol=1e-4, rtol=1e-4)
+            ):
+                warnings.warn(
+                    "Loaded checkpoint bounds differ from the labelled dataset. "
+                    "The model will load, but query coordinates may be unreliable "
+                    "unless the data and checkpoint belong to the same scene.",
+                    RuntimeWarning,
+                )
+        else:
+            model_kwargs = _infer_model_kwargs_from_state_dict(
+                ckpt["model"], self._data, max_coords, min_coords
+            )
+
+        model_kwargs.setdefault(
+            "image_rep_size", self._data[0]["clip_image_vector"].shape[-1]
+        )
+        model_kwargs.setdefault(
+            "text_rep_size", self._data[0]["clip_vector"].shape[-1]
+        )
+        model_kwargs.setdefault("max_coords", max_coords)
+        model_kwargs.setdefault("min_coords", min_coords)
+        model_kwargs["device"] = str(self.device)
+
+        self._label_model = GridCLIPModel(**model_kwargs).to(self.device)
         self._label_model.load_state_dict(ckpt["model"])
         self._label_model.eval()
         self._points_loader = DataLoader(
@@ -282,10 +354,23 @@ class CLIPFieldQuery:
             alpha = q.detach().cpu().numpy()
             threshold = torch.quantile(q[::10, ...], quantile).cpu().item()
 
-            a_norm = (alpha - alpha.min()) / (alpha.max() - alpha.min())
+            # a_norm = (alpha - alpha.min()) / (alpha.max() - alpha.min())
+            # a_norm_tensor = torch.as_tensor(a_norm)
+            # best_idx = int(torch.argmax(a_norm_tensor).item())
+            # best_point = all_xyz[best_idx].numpy().copy()
+
+            denom = alpha.max() - alpha.min()
+            if denom < 1e-12:
+                a_norm = np.zeros_like(alpha)
+            else:
+                a_norm = (alpha - alpha.min()) / denom
             a_norm_tensor = torch.as_tensor(a_norm)
-            best_idx = int(torch.argmax(a_norm_tensor).item())
-            best_point = all_xyz[best_idx].numpy().copy()
+            topk = min(50, len(a_norm_tensor))
+            topk_indices = torch.topk(a_norm_tensor, topk).indices
+            topk_scores = a_norm_tensor[topk_indices].numpy()
+            topk_points = all_xyz[topk_indices].numpy()
+            weights = topk_scores / topk_scores.sum()
+            best_point = (topk_points * weights[:, None]).sum(axis=0)
 
             mask = alpha > threshold
             matched_points = all_xyz[mask].numpy().copy()
@@ -296,7 +381,94 @@ class CLIPFieldQuery:
                 points=matched_points,
                 best_point=best_point,
                 scores=matched_scores,
-                best_score=float(a_norm[best_idx]),
+                # best_score=float(a_norm[best_idx]),
+                best_score=float(topk_scores.max()),
             ))
 
         return results
+
+
+    def visualize(
+        self,
+        results: Union[QueryResult, List[QueryResult], Dict[str, QueryResult]],
+        save_path: Optional[str] = None,
+        point_size: float = 0.3,
+        highlight_size: float = 8.0,
+        best_point_size: float = 80.0,
+    ):
+        
+
+        if isinstance(results, dict):
+            result_list = list(results.values())
+        elif isinstance(results, QueryResult):
+            result_list = [results]
+        else:
+            result_list = results
+
+        all_xyz = self._all_xyz.detach().cpu().numpy()
+        step = max(1, len(all_xyz) // 50000)  
+        scene_pts = all_xyz[::step]
+
+        colors = ["#e6194b", "#3cb44b", "#4363d8", "#f58231",
+                  "#911eb4", "#42d4f4", "#f032e6", "#bfef45"]
+
+        fig = plt.figure(figsize=(14, 6))
+
+        # Coordinate convention (Z-up, confirmed from Open3D view):
+        #   X (red)   = depth / forward into scene
+        #   Y (green) = right (horizontal)
+        #   Z (blue)  = up (sky=high, floor=low)
+        # Top-down bird's-eye view  -> X-Y plane (looking down Z)
+        # Side elevation view       -> Y-Z plane (looking along X)
+
+        ax1 = fig.add_subplot(121)
+        ax1.scatter(scene_pts[:, 0], scene_pts[:, 1],
+                    c="#d0d0d0", s=point_size, alpha=0.3)
+
+        for i, r in enumerate(result_list):
+            c = colors[i % len(colors)]
+            if len(r.points) > 0:
+                ax1.scatter(r.points[:, 0], r.points[:, 1],
+                            c=c, s=highlight_size, alpha=0.7, label=r.query)
+            ax1.scatter(r.best_point[0], r.best_point[1],
+                        c=c, s=best_point_size, marker="*", edgecolors="black",
+                        linewidths=0.5, zorder=10)
+            ax1.annotate(r.query,
+                         (r.best_point[0], r.best_point[1]),
+                         textcoords="offset points", xytext=(8, 8),
+                         fontsize=8, fontweight="bold", color=c)
+
+        ax1.set_xlabel("X (depth/forward)")
+        ax1.set_ylabel("Y (right)")
+        ax1.set_title("Top-down view (X-Y, looking down Z)")
+        ax1.set_aspect("equal")
+        ax1.legend(fontsize=7, loc="best")
+
+        ax2 = fig.add_subplot(122)
+        ax2.scatter(scene_pts[:, 1], scene_pts[:, 2],
+                    c="#d0d0d0", s=point_size, alpha=0.3)
+
+        for i, r in enumerate(result_list):
+            c = colors[i % len(colors)]
+            if len(r.points) > 0:
+                ax2.scatter(r.points[:, 1], r.points[:, 2],
+                            c=c, s=highlight_size, alpha=0.7, label=r.query)
+            ax2.scatter(r.best_point[1], r.best_point[2],
+                        c=c, s=best_point_size, marker="*", edgecolors="black",
+                        linewidths=0.5, zorder=10)
+            ax2.annotate(r.query,
+                         (r.best_point[1], r.best_point[2]),
+                         textcoords="offset points", xytext=(8, 8),
+                         fontsize=8, fontweight="bold", color=c)
+
+        ax2.set_xlabel("Y (right)")
+        ax2.set_ylabel("Z (up)")
+        ax2.set_title("Side elevation view (Y-Z, looking along X)")
+        ax2.set_aspect("equal")
+        ax2.legend(fontsize=7, loc="best")
+
+        plt.tight_layout()
+        if save_path:
+            plt.savefig(save_path, dpi=200, bbox_inches="tight")
+            print(f"[CLIPFieldQuery] Saved visualization to {save_path}")
+        plt.show()
