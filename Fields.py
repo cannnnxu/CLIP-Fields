@@ -365,7 +365,7 @@ class CLIPFieldQuery:
             else:
                 a_norm = (alpha - alpha.min()) / denom
             a_norm_tensor = torch.as_tensor(a_norm)
-            topk = min(50, len(a_norm_tensor))
+            topk = min(3, len(a_norm_tensor))
             topk_indices = torch.topk(a_norm_tensor, topk).indices
             topk_scores = a_norm_tensor[topk_indices].numpy()
             topk_points = all_xyz[topk_indices].numpy()
